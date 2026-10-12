@@ -13,3 +13,5 @@ setenv
 state/
 AGENTS.md
 CLAUDE.md
+target/
+log/
