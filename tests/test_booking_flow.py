@@ -60,6 +60,38 @@ BOOKING_FORM = f"""
 """
 
 
+# What the portal can answer to a booking POST. PORTAL_ERROR_PAGE is the real
+# generic error page the portal served (captured in an earlier run); the others
+# are shaped like the live pages. SUCCESS_PAGE is an assumption: no real
+# confirmation has been captured yet.
+SUCCESS_PAGE = """
+<html><body><div id="content"><h2>Termin erfolgreich gebucht</h2>
+<p>Ihre Bestätigung wurde per E-Mail versandt.</p></div></body></html>
+"""
+REJECTED_PAGE = BOOKING_FORM.replace(
+    "<div>ignored</div>", "<div class='error'>Der eingegebene Text ist falsch</div>"
+)
+PORTAL_ERROR_PAGE = """
+<html><body><div id="content">RK-Termin An error occured while processing your
+appointment. This can be caused for example if you had your Browser open for a
+very long time or if you changed the adress manually ref-id: 5FA154DC28E5D406</div></body></html>
+"""
+
+
+def curl_answering(*pages):
+    """A _curl stand-in: GETs succeed; each POST writes the next page (the last
+    one repeats) to the output file, as the portal's answer."""
+    answers = list(pages)
+
+    def fake(url, output_file, post_fields=None):
+        if post_fields is not None:
+            page = answers.pop(0) if len(answers) > 1 else answers[0]
+            Path(output_file).write_text(page, encoding="utf-8")
+        return True
+
+    return fake
+
+
 from contextlib import contextmanager
 
 
@@ -217,9 +249,8 @@ class TestBookingFlow:
     def test_real_booking_posts_expected_payload(self, target, booking_config):
         h = self._handler(target)
         with patch.object(config, "BOOKING_DRY_RUN", False), \
-             patch.object(h, "_curl", return_value=True) as curl, \
+             patch.object(h, "_curl", side_effect=curl_answering(SUCCESS_PAGE)) as curl, \
              patch.object(h, "solve_captcha", return_value="ab12cd"), \
-             patch("lib.appointment_handler.extractors.captcha_was_rejected", return_value=False), \
              patch("lib.appointment_handler.notifications.notify_appointment_booked"):
             assert h.book_appointment("03.09.2026") is True
 
@@ -236,9 +267,8 @@ class TestBookingFlow:
         """The Kyiv confirmation mail shows the form records a passport number."""
         h = self._handler(target)
         with patch.object(config, "BOOKING_DRY_RUN", False), \
-             patch.object(h, "_curl", return_value=True) as curl, \
+             patch.object(h, "_curl", side_effect=curl_answering(SUCCESS_PAGE)) as curl, \
              patch.object(h, "solve_captcha", return_value="ab12cd"), \
-             patch("lib.appointment_handler.extractors.captcha_was_rejected", return_value=False), \
              patch("lib.appointment_handler.notifications.notify_appointment_booked"):
             assert h.book_appointment("03.09.2026") is True
 
@@ -250,9 +280,8 @@ class TestBookingFlow:
         h = self._handler(target)
         with patch.object(config, "BOOKING_DRY_RUN", False), \
              patch.object(config, "APPLICANT_EXTRA_FIELDS", {"passportNumber": "OVERRIDE1"}), \
-             patch.object(h, "_curl", return_value=True) as curl, \
+             patch.object(h, "_curl", side_effect=curl_answering(SUCCESS_PAGE)) as curl, \
              patch.object(h, "solve_captcha", return_value="ab12cd"), \
-             patch("lib.appointment_handler.extractors.captcha_was_rejected", return_value=False), \
              patch("lib.appointment_handler.notifications.notify_appointment_booked"):
             assert h.book_appointment("03.09.2026") is True
 
@@ -280,9 +309,8 @@ class TestBookingFlow:
         h = self._handler(target)
         with patch.object(config, "BOOKING_DRY_RUN", False), \
              patch.object(config, "CAPTCHA_MAX_ATTEMPTS", 3), \
-             patch.object(h, "_curl", return_value=True), \
+             patch.object(h, "_curl", side_effect=curl_answering(REJECTED_PAGE)), \
              patch.object(h, "solve_captcha", return_value="wrong"), \
-             patch("lib.appointment_handler.extractors.captcha_was_rejected", return_value=True), \
              patch.object(h, "report_bad_captcha") as report:
             assert h.book_appointment("03.09.2026") is False
             assert report.call_count == 3  # every miss refunded
@@ -292,9 +320,8 @@ class TestBookingFlow:
         h = self._handler(target)
         with patch.object(config, "BOOKING_DRY_RUN", False), \
              patch.object(config, "CAPTCHA_MAX_ATTEMPTS", 3), \
-             patch.object(h, "_curl", return_value=True), \
+             patch.object(h, "_curl", side_effect=curl_answering(REJECTED_PAGE, SUCCESS_PAGE)), \
              patch.object(h, "solve_captcha", side_effect=["wrong", "right"]), \
-             patch("lib.appointment_handler.extractors.captcha_was_rejected", side_effect=[True, False]), \
              patch("lib.appointment_handler.notifications.notify_appointment_booked") as notify, \
              patch.object(h, "report_bad_captcha"):
             assert h.book_appointment("03.09.2026") is True
@@ -434,6 +461,244 @@ class TestEmbassyDefinedFields:
         assert extractors.pick_submit_action(form["submits"]) == (
             "action:appointment_addAppointment", "Speichern",
         )
+
+
+# Shaped like the live Dhaka form seen in a dry run: the passport is the
+# embassy-defined "fields[0].content", labelled "Passnummer:" - a word none of
+# the passport hints used to contain, so the field was posted empty.
+DHAKA_FORM = f"""
+<html><body><div id="content"><div><fieldset><div>x</div><div>09.11.2026 11:10</div>
+<form id="appointment_newAppointmentForm"
+      action="/rktermin/extern/appointment_showForm.do" method="post">
+  <div><captcha><div style="background:white url('data:image/png;base64,{'QUJD' * 4}')"></div></captcha></div>
+  <p>Nachname:</p><input type="text" name="lastname" value=""/>
+  <p>Vorname:</p><input type="text" name="firstname" value=""/>
+  <p>E-Mail:</p><input type="text" name="email" value=""/>
+  <p>E-Mail wiederholen:</p><input type="text" name="emailrepeat" value=""/>
+  <p>Passnummer:</p>
+  <input type="text" name="fields[0].content" value=""/>
+  <input type="hidden" name="fields[0].definitionId" value="13608"/>
+  <input type="hidden" name="fields[0].index" value="0"/>
+  <input type="text" name="captchaText" value=""/>
+  <input type="submit" name="action:appointment_addAppointment" value="Speichern"/>
+</form></fieldset></div></div></body></html>
+"""
+
+
+class TestDhakaPassport:
+    @pytest.fixture
+    def dhaka(self, tmp_path):
+        t = tmp_path / "target"
+        t.mkdir()
+        (t / "bookfinalappt.html").write_text(DHAKA_FORM, encoding="utf-8")
+        return tmp_path
+
+    def test_hint_exists_and_is_bound_to_the_passport_setting(self):
+        assert "passnummer" in config.APPLICANT_FIELD_HINTS
+        assert config.APPLICANT_FIELD_HINTS["passnummer"] == config.APPLICANT_FIELD_HINTS["passport"]
+
+    def test_passport_filled_by_its_label_and_companions_kept(self, dhaka):
+        from lib.appointment_handler import AppointmentHandler
+        form = extractors.extract_form_context(str(dhaka), "bookfinalappt.html")
+        with applicant(), patch.object(config, "APPLICANT_EXTRA_FIELDS", {}):
+            hints = dict(config.APPLICANT_FIELD_HINTS)
+            hints["passnummer"] = "C01548134"
+            with patch.object(config, "APPLICANT_FIELD_HINTS", hints):
+                f = AppointmentHandler(root_folder=str(dhaka))._fill_applicant_fields(form)
+        assert f["fields[0].content"] == "C01548134"
+        assert f["fields[0].definitionId"] == "13608"
+        assert f["fields[0].index"] == "0"
+
+
+class TestBookingOutcome:
+    """A booking is only reported as made when the portal confirms it."""
+
+    def _classify(self, tmp_path, page):
+        t = tmp_path / "target"
+        t.mkdir(exist_ok=True)
+        if page is not None:
+            (t / "bookingdone.html").write_text(page, encoding="utf-8")
+        return extractors.classify_booking_response(str(tmp_path), "bookingdone.html")
+
+    def test_confirmation_is_booked(self, tmp_path):
+        assert self._classify(tmp_path, SUCCESS_PAGE) == extractors.BOOKED
+
+    def test_captcha_complaint(self, tmp_path):
+        assert self._classify(tmp_path, REJECTED_PAGE) == extractors.CAPTCHA_REJECTED
+
+    def test_real_generic_error_page_is_not_a_booking(self, tmp_path):
+        """The page the portal really returned used to be reported as booked."""
+        assert self._classify(tmp_path, PORTAL_ERROR_PAGE) == extractors.PORTAL_ERROR
+
+    def test_form_coming_back_is_a_form_error(self, tmp_path):
+        assert self._classify(tmp_path, DHAKA_FORM) == extractors.FORM_ERROR
+
+    def test_missing_empty_or_unknown_page_is_unconfirmed(self, tmp_path):
+        assert self._classify(tmp_path, None) == extractors.UNCONFIRMED
+        assert self._classify(tmp_path, "   ") == extractors.UNCONFIRMED
+        assert self._classify(tmp_path, "<html><body>Danke.</body></html>") == extractors.UNCONFIRMED
+
+    def _book(self, target, *pages, captchas=("ab12cd",)):
+        h = AppointmentHandlerFor(target)
+        with patch.object(config, "BOOKING_DRY_RUN", False), \
+             patch.object(config, "CAPTCHA_MAX_ATTEMPTS", 3), \
+             patch.object(h, "_curl", side_effect=curl_answering(*pages)) as curl, \
+             patch.object(h, "solve_captcha", side_effect=list(captchas) * 3), \
+             patch.object(h, "report_bad_captcha") as report, \
+             patch("lib.appointment_handler.notifications.notify_appointment_booked") as booked, \
+             patch("lib.appointment_handler.notifications.notify_error") as error:
+            result = h.book_appointment("03.09.2026")
+        posts = [c for c in curl.call_args_list if c.kwargs.get("post_fields") is not None]
+        return result, len(posts), report, booked, error
+
+    def test_portal_error_stops_without_retry_or_false_notification(self, target, booking_config):
+        result, posts, report, booked, error = self._book(target, PORTAL_ERROR_PAGE)
+        assert result is False
+        assert posts == 1                    # a retry could double-book
+        booked.assert_not_called()
+        error.assert_called_once()
+        report.assert_not_called()           # not a captcha miss, no refund claim
+
+    def test_unrecognised_answer_stops_without_retry(self, target, booking_config):
+        result, posts, _, booked, error = self._book(target, "<html>Danke.</html>")
+        assert result is False and posts == 1
+        booked.assert_not_called()
+        error.assert_called_once()
+
+    def test_form_error_retries_then_gives_up(self, target, booking_config):
+        result, posts, report, booked, _ = self._book(target, DHAKA_FORM)
+        assert result is False
+        assert posts == 3
+        booked.assert_not_called()
+        report.assert_not_called()
+
+    def test_form_error_then_confirmation_books(self, target, booking_config):
+        result, posts, _, booked, _ = self._book(target, DHAKA_FORM, SUCCESS_PAGE)
+        assert result is True and posts == 2
+        booked.assert_called_once()
+
+
+class TestBookedLatch:
+    """After a booking goes out, no later run may book a second slot."""
+
+    def _run(self, target, *pages, dry_run=False):
+        h = AppointmentHandlerFor(target)
+        with patch.object(config, "BOOKING_DRY_RUN", dry_run), \
+             patch.object(config, "CAPTCHA_MAX_ATTEMPTS", 2), \
+             patch.object(h, "_curl", side_effect=curl_answering(*pages)) as curl, \
+             patch.object(h, "solve_captcha", return_value="ab12cd"), \
+             patch.object(h, "report_bad_captcha"), \
+             patch("lib.appointment_handler.notifications.notify_appointment_booked"), \
+             patch("lib.appointment_handler.notifications.notify_error"):
+            result = h.book_appointment("03.09.2026")
+        return h, result, curl
+
+    def _latch(self, target):
+        return target / "state" / "booked.json"
+
+    @pytest.mark.parametrize("page", [SUCCESS_PAGE, "<html>Danke.</html>", PORTAL_ERROR_PAGE])
+    def test_latched_when_booking_went_out(self, target, booking_config, page):
+        self._run(target, page)
+        assert self._latch(target).exists()
+
+    @pytest.mark.parametrize("page", [REJECTED_PAGE, DHAKA_FORM])
+    def test_not_latched_when_portal_clearly_refused(self, target, booking_config, page):
+        self._run(target, page)
+        assert not self._latch(target).exists()
+
+    def test_latch_records_the_booking_and_keeps_the_portal_answer(self, target, booking_config):
+        import json
+        self._run(target, SUCCESS_PAGE)
+        record = json.loads(self._latch(target).read_text(encoding="utf-8"))
+        assert record["outcome"] == extractors.BOOKED
+        assert record["date"] == "03.09.2026"
+        assert "\t" not in (record["time"] or "") and "\n" not in (record["time"] or "")
+        kept = target / "state" / record["portal_answer"]
+        assert "erfolgreich gebucht" in kept.read_text(encoding="utf-8")
+
+    def test_latched_before_the_post_so_a_lost_reply_cannot_double_book(self, target, booking_config):
+        """The request may reach the portal even if the answer never comes back."""
+        h = AppointmentHandlerFor(target)
+        seen = {}
+
+        def curl(url, out, post_fields=None):
+            if post_fields is not None:
+                seen["latched_at_post"] = (target / "state" / "booked.json").exists()
+                return False                     # connection dropped after sending
+            return True
+
+        with patch.object(config, "BOOKING_DRY_RUN", False), \
+             patch.object(h, "_curl", side_effect=curl), \
+             patch.object(h, "solve_captcha", return_value="ab12cd"), \
+             patch("lib.appointment_handler.notifications.notify_error") as error:
+            assert h.book_appointment("03.09.2026") is False
+        assert seen["latched_at_post"] is True
+        assert self._latch(target).exists()      # still there: it may have gone through
+        error.assert_called_once()
+
+    def test_post_that_raises_leaves_the_latch(self, target, booking_config):
+        h = AppointmentHandlerFor(target)
+
+        def curl(url, out, post_fields=None):
+            if post_fields is not None:
+                raise RuntimeError("killed mid-request")
+            return True
+
+        with patch.object(config, "BOOKING_DRY_RUN", False), \
+             patch.object(h, "_curl", side_effect=curl), \
+             patch.object(h, "solve_captcha", return_value="ab12cd"):
+            with pytest.raises(RuntimeError):
+                h.book_appointment("03.09.2026")
+        assert self._latch(target).exists()
+
+    def test_no_post_if_the_marker_cannot_be_written(self, target, booking_config):
+        h = AppointmentHandlerFor(target)
+        with patch.object(config, "BOOKING_DRY_RUN", False), \
+             patch.object(h, "_write_latch", return_value=False), \
+             patch.object(h, "_curl", side_effect=curl_answering(SUCCESS_PAGE)) as curl, \
+             patch.object(h, "solve_captcha", return_value="ab12cd"):
+            assert h.book_appointment("03.09.2026") is False
+        assert all(c.kwargs.get("post_fields") is None for c in curl.call_args_list)
+
+    def test_form_error_then_success_ends_with_one_booked_latch(self, target, booking_config):
+        import json
+        self._run(target, DHAKA_FORM, SUCCESS_PAGE)
+        record = json.loads(self._latch(target).read_text(encoding="utf-8"))
+        assert record["outcome"] == extractors.BOOKED
+
+    def test_second_real_booking_is_refused_without_touching_the_portal(self, target, booking_config):
+        self._run(target, SUCCESS_PAGE)
+        _, result, curl = self._run(target, SUCCESS_PAGE)
+        assert result is False
+        curl.assert_not_called()
+
+    def test_dry_run_ignores_the_latch(self, target, booking_config):
+        self._run(target, SUCCESS_PAGE)
+        _, result, _ = self._run(target, SUCCESS_PAGE, dry_run=True)
+        assert result is True
+
+    def test_scheduled_run_skips_everything_once_latched(self, target, booking_config):
+        self._run(target, SUCCESS_PAGE)
+        h = AppointmentHandlerFor(target)
+        with patch.object(config, "BOOKING_DRY_RUN", False), patch.object(config, "AUTO_BOOK", True), \
+             patch.object(h, "fetch_month_view") as fetch:
+            assert h.run_full_workflow() is True
+        fetch.assert_not_called()          # no portal request, no captcha spend
+
+    def test_each_check_is_recorded(self, target):
+        h = AppointmentHandlerFor(target)
+        with patch.object(config, "BOOKING_DRY_RUN", True), patch.object(config, "AUTO_BOOK", False), \
+             patch.object(h, "fetch_month_view", return_value=True), \
+             patch.object(h, "check_and_notify_available_date", side_effect=[None, "03.09.2026"]):
+            h.run_full_workflow()
+            h.run_full_workflow()
+        rows = (target / "state" / "checks.csv").read_text(encoding="utf-8").splitlines()
+        assert rows[0].endswith(",none") and rows[1].endswith(",slot:03.09.2026")
+
+
+def AppointmentHandlerFor(root):
+    from lib.appointment_handler import AppointmentHandler
+    return AppointmentHandler(root_folder=str(root))
 
 
 class TestCaptchaFormAutodetect:

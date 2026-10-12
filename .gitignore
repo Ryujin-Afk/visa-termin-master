@@ -8,3 +8,8 @@ venv/
 
 # Local config - holds your 2Captcha API key and Telegram token
 setenv
+
+# Runtime state: booked marker, saved portal answers, check history (may hold personal details)
+state/
+AGENTS.md
+CLAUDE.md

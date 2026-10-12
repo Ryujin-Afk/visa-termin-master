@@ -5,8 +5,11 @@ Orchestrates the entire appointment checking and booking workflow.
 """
 import sys
 import os
+import json
+import shutil
 import subprocess
 import time
+from datetime import datetime
 from typing import Optional, Dict, Any
 from urllib.parse import unquote
 
@@ -284,6 +287,13 @@ class AppointmentHandler:
         if not self._applicant_is_configured():
             return False
 
+        if not config.BOOKING_DRY_RUN and self._booking_is_latched():
+            self.logger.error(
+                "A booking was already submitted (state/booked.json) - not booking again. "
+                "Delete that file after checking the mailbox to allow it."
+            )
+            return False
+
         # 5a. Follow the day link for this date from the month view.
         day_links = [
             url for url in extractors.extract_links(self.root_folder, "response.html", "appointment_showDay.do")
@@ -315,6 +325,8 @@ class AppointmentHandler:
                 return False
 
             booking_time = extractors.extract_booking_time(self.root_folder, "bookfinalappt.html")
+            if booking_time:
+                booking_time = " ".join(booking_time.split())   # the portal pads it with tabs/newlines
             self.logger.info(f"Booking time: {booking_time or 'unknown'}")
 
             solution = self.solve_captcha("bookfinalappt.html", None)
@@ -344,18 +356,67 @@ class AppointmentHandler:
                 f"Submitting booking for {available_date} at {booking_time} via {submit[0]}"
             )
             done_page = os.path.join(self.root_folder, "target", "bookingdone.html")
-            if not self._curl(form["action"], done_page, post_fields=fields):
+
+            # Latch BEFORE the POST: if the request reaches the portal but the
+            # answer never arrives (timeout, crash), the booking may exist and a
+            # later run must not book again. No marker, no POST.
+            if not self._write_latch("submitting", available_date, booking_time):
+                self.logger.error("Could not record the pending booking - not submitting")
                 return False
 
-            if not extractors.captcha_was_rejected(self.root_folder, "bookingdone.html"):
+            if not self._curl(form["action"], done_page, post_fields=fields):
+                self.logger.error("The booking request failed - it may or may not have gone through")
+                notifications.notify_error(
+                    f"The booking request for {available_date} failed mid-way and may have "
+                    f"gone through. Check the applicant's mailbox. Further bookings are paused "
+                    f"until state/booked.json is deleted."
+                )
+                return False
+
+            outcome = extractors.classify_booking_response(self.root_folder, "bookingdone.html")
+
+            if outcome in (extractors.CAPTCHA_REJECTED, extractors.FORM_ERROR):
+                self._clear_latch()      # clearly refused: nothing was booked
+
+            if outcome == extractors.BOOKED:
+                self._write_latch(outcome, available_date, booking_time)
                 self.logger.info("Appointment successfully booked!")
                 notifications.notify_appointment_booked(available_date, booking_time or "")
                 return True
 
-            self.logger.warning(f"Booking captcha rejected (attempt {attempt})")
-            self.report_bad_captcha()
+            if outcome == extractors.CAPTCHA_REJECTED:
+                self.logger.warning(f"Booking captcha rejected (attempt {attempt})")
+                self.report_bad_captcha()
+                continue
 
-        self.logger.error("Could not book: captcha rejected on every attempt")
+            if outcome == extractors.FORM_ERROR:
+                # The form came back without a recognised captcha complaint, so a
+                # field was probably refused. Retrying costs a captcha each time.
+                self.logger.warning(
+                    f"Booking form came back after submit (attempt {attempt}) - "
+                    f"a field may have been rejected; see target/bookingdone.html"
+                )
+                continue
+
+            # PORTAL_ERROR or UNCONFIRMED: do not retry within this run. If the
+            # booking did go through, a second attempt would try to book again.
+            # (Nothing stops a LATER run from booking again - see the AUTO-BOOKING
+            # warning in setenv.example.)
+            detail = (
+                "the portal returned its generic error page"
+                if outcome == extractors.PORTAL_ERROR
+                else "the portal's answer was not recognised as a confirmation"
+            )
+            self.logger.error(f"Booking NOT confirmed for {available_date}: {detail}")
+            self._write_latch(outcome, available_date, booking_time)
+            notifications.notify_error(
+                f"Booking for {available_date} was submitted but {detail}. "
+                f"Check the applicant's mailbox for a confirmation. Further bookings are "
+                f"paused until state/booked.json is deleted."
+            )
+            return False
+
+        self.logger.error("Could not book: the portal did not accept the booking on any attempt")
         return False
 
     def _fill_applicant_fields(self, form: Dict[str, Any]) -> Dict[str, str]:
@@ -448,6 +509,80 @@ class AppointmentHandler:
         )
         return ""
 
+    # -- State that must outlive a run: run.sh wipes target/ every time ---------
+
+    def _state_path(self, name: str) -> str:
+        state_dir = os.path.join(self.root_folder, "state")
+        os.makedirs(state_dir, exist_ok=True)
+        return os.path.join(state_dir, name)
+
+    def _booking_is_latched(self) -> bool:
+        """True once a booking was submitted and not rejected (see _write_latch)."""
+        return os.path.exists(os.path.join(self.root_folder, "state", "booked.json"))
+
+    def _clear_latch(self) -> None:
+        """Remove the pending marker after the portal clearly refused the booking."""
+        try:
+            os.remove(os.path.join(self.root_folder, "state", "booked.json"))
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            # Leaving it blocks later bookings, which is the safe direction.
+            self.logger.error(f"Could not clear the pending marker: {e}")
+
+    def _write_latch(self, outcome: str, date: str, time_str: Optional[str]) -> bool:
+        """
+        Remember that a booking went out, so no later run books a second slot
+        under the same passport (which can get the applicant blocked).
+
+        Written with outcome "submitting" just BEFORE the POST, then replaced
+        by the final outcome. It is removed again only when the portal clearly
+        refused (captcha or form rejected); for confirmed, unconfirmed, generic
+        error or a request that failed mid-way the booking may exist, so it
+        stays. Delete state/booked.json after checking the mailbox to allow
+        booking again. A copy of the portal's answer is kept here too, since the
+        next run deletes target/.
+
+        Returns:
+            True if the marker was written
+        """
+        try:
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            saved = None
+            answer = os.path.join(self.root_folder, "target", "bookingdone.html")
+            if os.path.exists(answer):
+                saved = self._state_path(f"bookingdone-{stamp}.html")
+                shutil.copy2(answer, saved)
+            record = {
+                "at": datetime.now().isoformat(timespec="seconds"),
+                "outcome": outcome,
+                "date": date,
+                "time": " ".join(time_str.split()) if time_str else None,
+                "location": config.LOCATION_CODE,
+                "category": config.CATEGORY_ID,
+                "portal_answer": os.path.basename(saved) if saved else None,
+            }
+            with open(self._state_path("booked.json"), "w", encoding="utf-8") as f:
+                json.dump(record, f, indent=2)
+            self.logger.warning(
+                "Wrote state/booked.json - no further bookings until it is deleted"
+            )
+            return True
+        except OSError as e:
+            self.logger.error(f"Could not write the booked marker: {e}")
+            return False
+
+    def _record_check(self, result: str) -> None:
+        """Append one line per run to state/checks.csv, to learn when slots appear."""
+        try:
+            with open(self._state_path("checks.csv"), "a", encoding="utf-8") as f:
+                f.write(
+                    f"{datetime.now().isoformat(timespec='seconds')},"
+                    f"{config.LOCATION_CODE},{config.REALM_ID},{config.CATEGORY_ID},{result}\n"
+                )
+        except OSError as e:
+            self.logger.error(f"Could not record the check: {e}")
+
     def _applicant_is_configured(self) -> bool:
         """Check that the details the portal writes into the booking are present."""
         missing = [
@@ -486,13 +621,25 @@ class AppointmentHandler:
             True if workflow completed successfully
         """
         try:
+            # After a submitted booking, real runs stop here: no captcha spend, no
+            # second booking. Dry runs are unaffected.
+            if (auto_book or config.AUTO_BOOK) and not config.BOOKING_DRY_RUN \
+                    and self._booking_is_latched():
+                self.logger.warning(
+                    "A booking was already submitted (state/booked.json) - skipping this run. "
+                    "Delete that file to resume."
+                )
+                return True
+
             # Steps 1-3: reach the month view, retrying on a misread captcha
             if not self.fetch_month_view():
+                self._record_check("error")
                 return False
 
             # Step 4: Check for available dates
             available_date = self.check_and_notify_available_date()
-            
+            self._record_check(f"slot:{available_date}" if available_date else "none")
+
             # Step 5: Auto-book if enabled and date available
             if available_date and (auto_book or config.AUTO_BOOK):
                 self.book_appointment(available_date)

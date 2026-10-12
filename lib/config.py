@@ -145,6 +145,7 @@ APPLICANT_FIELD_HINTS = {
     "passno": APPLICANT_PASSPORT,
     # label-based, in the languages the portal actually uses
     "reisepass": APPLICANT_PASSPORT,
+    "passnummer": APPLICANT_PASSPORT,   # Dhaka: label "Passnummer:" on "fields[0].content"
     "pasport": APPLICANT_PASSPORT,
     "geburtsdatum": APPLICANT_BIRTHDATE,
     "date of birth": APPLICANT_BIRTHDATE,
@@ -227,6 +228,36 @@ CAPTCHA_ERROR_MARKERS = [
     for marker in os.environ.get(
         "CAPTCHA_ERROR_MARKERS",
         "eingegebene text ist falsch|entered text was wrong",
+    ).split("|")
+    if marker.strip()
+]
+
+# After a booking POST the portal answers with one of: a confirmation, the
+# booking form again (captcha or validation error), or a generic error page.
+# Only a recognised confirmation counts as booked; anything else is treated as
+# unconfirmed, because a false "booked" means a missed appointment.
+#
+# The default error marker is the portal's real generic error page
+# ("An error occured while processing your appointment", sic). The default
+# success markers are UNVERIFIED guesses - no real confirmation page has been
+# captured yet, so the first real booking will probably be reported as
+# unconfirmed - check the confirmation mail, then set BOOKING_SUCCESS_MARKERS to
+# wording from the real page. Keep the markers specific: a loose one such as
+# "has been booked" could also match a "slot taken" page. Note run.sh wipes
+# target/ on every run, so copy bookingdone.html out before the next run.
+PORTAL_ERROR_MARKERS = [
+    marker.strip().lower()
+    for marker in os.environ.get(
+        "PORTAL_ERROR_MARKERS",
+        "error occured while processing|error occurred while processing",
+    ).split("|")
+    if marker.strip()
+]
+BOOKING_SUCCESS_MARKERS = [
+    marker.strip().lower()
+    for marker in os.environ.get(
+        "BOOKING_SUCCESS_MARKERS",
+        "erfolgreich gebucht|successfully booked",
     ).split("|")
     if marker.strip()
 ]

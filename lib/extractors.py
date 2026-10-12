@@ -4,6 +4,7 @@ Provides functions to extract specific information from visa portal HTML pages.
 Supports both legacy and new German embassy portal layouts.
 """
 import os
+import re
 from typing import Optional
 from urllib.parse import urljoin
 from . import config, utils, booking_process
@@ -254,6 +255,59 @@ def captcha_was_rejected(
 
     page_text = content.lower()
     return any(marker in page_text for marker in config.CAPTCHA_ERROR_MARKERS)
+
+
+# Outcomes of a booking POST, see classify_booking_response()
+BOOKED = "booked"
+CAPTCHA_REJECTED = "captcha_rejected"
+FORM_ERROR = "form_error"
+PORTAL_ERROR = "portal_error"
+UNCONFIRMED = "unconfirmed"
+
+
+def classify_booking_response(
+    root_folder: str,
+    response_html_file: str = "bookingdone.html"
+) -> str:
+    """
+    Decide what the portal's answer to a booking POST means.
+
+    Only a recognised confirmation counts as BOOKED. Treating "no captcha
+    error" as success would report a rejected booking (an empty required
+    field, or the portal's generic error page) as a made appointment.
+
+    Returns:
+        BOOKED            a confirmation marker is on the page
+        CAPTCHA_REJECTED  the captcha was wrong; retry with a new one
+        FORM_ERROR        the booking form came back (validation error, or a
+                          captcha complaint worded in a way we don't know);
+                          a retry is reasonable
+        PORTAL_ERROR      the portal's generic error page; do not retry
+        UNCONFIRMED       none of the above (or an empty page): the booking
+                          may or may not exist, so do not retry
+    """
+    html_path = os.path.join(root_folder, "target", response_html_file)
+    content = utils.read_file_content(html_path)
+    if not content or not content.strip():
+        return UNCONFIRMED
+
+    if captcha_was_rejected(root_folder, response_html_file):
+        return CAPTCHA_REJECTED
+
+    page_text = content.lower()
+
+    if any(marker in page_text for marker in config.PORTAL_ERROR_MARKERS):
+        return PORTAL_ERROR
+
+    # The booking form is only served again when the submission was not accepted.
+    if re.search(r"""name\s*=\s*["']?captchatext""", page_text) or \
+            "action:appointment_addappointment" in page_text:
+        return FORM_ERROR
+
+    if any(marker in page_text for marker in config.BOOKING_SUCCESS_MARKERS):
+        return BOOKED
+
+    return UNCONFIRMED
 
 
 def extract_booking_time(
