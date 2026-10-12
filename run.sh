@@ -38,6 +38,26 @@ fi
 
 cd "$ROOT_FOLDER"
 
+# Windows consoles default to cp1252 and choke on the emoji in log lines.
+export PYTHONUTF8=1
+
+# Pick the Python interpreter: the project's virtualenv first (it has the
+# dependencies installed), then python3, then python. On Windows "python3" is
+# often only a Microsoft Store stub, so the venv must win.
+PYTHON=""
+for candidate in ".venv/Scripts/python.exe" ".venv/bin/python" python3 python; do
+    if [ -x "$candidate" ] || command -v "$candidate" > /dev/null 2>&1; then
+        if "$candidate" -c 'import sys' > /dev/null 2>&1; then
+            PYTHON="$candidate"
+            break
+        fi
+    fi
+done
+if [ -z "$PYTHON" ]; then
+    echo "ERROR: no working Python found (looked for .venv, python3, python)"
+    exit 1
+fi
+
 # Set up logging
 LOG_FILE="$ROOT_FOLDER/log/log.txt"
 mkdir -p "$(dirname "$LOG_FILE")"
@@ -84,7 +104,7 @@ main() {
 
     # Run Python handler. Guarded by "if" so that a non-zero exit does not trip
     # "set -e" before the result can be captured and logged.
-    if python3 lib/appointment_handler.py "$ROOT_FOLDER" $AUTO_BOOK_FLAG; then
+    if "$PYTHON" lib/appointment_handler.py "$ROOT_FOLDER" $AUTO_BOOK_FLAG; then
         RESULT=0
     else
         RESULT=$?
