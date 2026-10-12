@@ -93,7 +93,7 @@ export LATEST_DATE=""
 # Create a bot with BotFather: https://t.me/botfather
 export TELEGRAM_BOT_TOKEN="your_bot_token_here"
 
-# Chat ID where to send notifications
+# Chat ID where to send notifications (several allowed, comma separated: "111111,222222")
 # Send a message to your bot and get the chat_id
 export TELEGRAM_CHAT_ID="your_chat_id_here"
 

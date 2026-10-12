@@ -25,30 +25,52 @@ def send_telegram_notification(message: str) -> bool:
         logger.warning("Telegram credentials not configured")
         return False
     
+    api_url = f"{config.TELEGRAM_API_URL}{config.TELEGRAM_BOT_TOKEN}/sendMessage"
+    delivered = 0
+
+    # TELEGRAM_CHAT_ID may list several recipients, comma separated.
+    for chat_id in _chat_ids():
+        try:
+            # Use curl to send message
+            cmd = [
+                "curl",
+                "-s",
+                "-X", "POST",
+                api_url,
+                "-d", f"chat_id={chat_id}",
+                "-d", f"text={quote(message)}"
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+
+            # curl exits 0 even when Telegram refuses the message (blocked bot,
+            # wrong chat), so the reply body decides.
+            if result.returncode == 0 and _telegram_said_ok(result.stdout):
+                delivered += 1
+            else:
+                logger.error(
+                    f"Telegram did not deliver to chat {chat_id}: "
+                    f"{(result.stdout or result.stderr).strip()[:200]}"
+                )
+
+        except Exception as e:
+            logger.error(f"Error sending Telegram notification to chat {chat_id}: {e}")
+
+    if delivered:
+        logger.info(f"Telegram notification sent to {delivered} chat(s): {message}")
+    return delivered > 0
+
+
+def _chat_ids() -> list:
+    """Chat IDs from TELEGRAM_CHAT_ID (one, or several separated by commas)."""
+    return [c.strip() for c in str(config.TELEGRAM_CHAT_ID).split(",") if c.strip()]
+
+
+def _telegram_said_ok(body: str) -> bool:
+    """True if Telegram's JSON reply says the message was accepted."""
     try:
-        api_url = f"{config.TELEGRAM_API_URL}{config.TELEGRAM_BOT_TOKEN}/sendMessage"
-        
-        # Use curl to send message
-        cmd = [
-            "curl",
-            "-s",
-            "-X", "POST",
-            api_url,
-            "-d", f"chat_id={config.TELEGRAM_CHAT_ID}",
-            "-d", f"text={quote(message)}"
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if result.returncode == 0:
-            logger.info(f"Telegram notification sent: {message}")
-            return True
-        else:
-            logger.error(f"Failed to send Telegram notification: {result.stderr}")
-            return False
-            
-    except Exception as e:
-        logger.error(f"Error sending Telegram notification: {e}")
+        return json.loads(body).get("ok") is True
+    except (ValueError, AttributeError):
         return False
 
 
